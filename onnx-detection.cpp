@@ -11,9 +11,18 @@
 #include <numeric>
 #include <string>
 #include <vector>
+#include <sstream>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
+
+std::string print_shape(const std::vector<int64_t>& v) {
+  std::stringstream ss("");
+  for (size_t i = 0; i < v.size() - 1; i++)
+    ss << v[i] << "x";
+  ss << v[v.size() - 1];
+  return ss.str();
+}
 
 int YOLO_GRID_X = 13;
 int YOLO_GRID_Y = 13;
@@ -264,7 +273,7 @@ int main(int argc, char* argv[])
   const double confidenceThreshold = 0.5;
   const double maskThreshold = 0.6;
 
-  const std::string modelFilepath = "data/models/Model.onnx";
+  const std::string modelFilepath = "data/models/model.onnx";
   const std::string imageFilepath = "data/images/test.jpg";
   const std::string labelFilepath = "data/labels/VOC_pascal_classes.txt";
   const std::string instanceName = "image-classification-inference";
@@ -275,7 +284,7 @@ int main(int argc, char* argv[])
   stbi_uc * img_data = stbi_load(imageFilepath.c_str(), &imageWidth,
       &imageHeight, &imageChannels, STBI_default);
 
-  if (imageWidth != 416 || imageHeight != 416 || imageChannels != 3)
+  if (imageWidth != 1200 || imageHeight != 1200 || imageChannels != 3)
   {
     printf("Image size does't match with 416 x 416 x 3");
     return 1;
@@ -327,8 +336,13 @@ int main(int argc, char* argv[])
     inputDims[0] = 1;
   std::cout << "Input Dimensions: " << inputDims << std::endl;
 
-  std::string outputName = session.GetOutputName(0, allocator);
-  std::cout << "Output Name: " << outputName << std::endl;
+  std::cout << "Output Name: " << std::endl;
+  std::vector<const char*> outputNames;
+  for (size_t i = 0; i < session.GetOutputCount(); ++i)
+  {
+    std::cout << session.GetOutputName(i, allocator) << std::endl;
+    outputNames.push_back(session.GetOutputName(i, allocator));
+  }
 
   Ort::TypeInfo outputTypeInfo = session.GetOutputTypeInfo(0);
   auto outputTensorInfo = outputTypeInfo.GetTensorTypeAndShapeInfo();
@@ -343,9 +357,13 @@ int main(int argc, char* argv[])
   const size_t inputTensorSize = imageWidth * imageHeight * imageChannels;
   std::vector<float> inputTensorValues(inputTensorSize);
 
+  std::cout << inputTensorSize << std::endl;
+
   // Transpose image.
   Image *img = new Image(imageWidth, imageHeight, 3);
   size_t shift = 0;
+  std::vector<float> mean{0.485, 0.456, 0.406};
+  std::vector<float> std{0.229, 0.224, 0.225};
   for (size_t c = 0; c < 3; ++c)
   {
     for (size_t y = 0; y < imageHeight; ++y)
@@ -354,20 +372,14 @@ int main(int argc, char* argv[])
       {
         const int val(imgPixels[y * imageWidth + x].RGBA[c]);
         img->set((y * imageWidth + x) * 3 + c, val);
-        inputTensorValues[shift] = val;
+        inputTensorValues[shift] = (val / 255 - mean[c]) / std[c];
       }
     }
   }
 
-  // Has to match with the model output type.
-  const size_t outputTensorSize = vectorProduct(outputDims);
-  std::vector<float> outputTensorValues(outputTensorSize);
-
   std::vector<const char*> inputNames{inputName};
-  std::vector<const char*> outputNames{outputName.c_str()};
 
   std::vector<Ort::Value> inputTensors;
-  std::vector<Ort::Value> outputTensors;
 
   Ort::MemoryInfo memoryInfo = Ort::MemoryInfo::CreateCpu(
       OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
@@ -376,90 +388,25 @@ int main(int argc, char* argv[])
       memoryInfo, inputTensorValues.data(), inputTensorSize, inputDims.data(),
       inputDims.size()));
 
-  outputTensors.push_back(Ort::Value::CreateTensor<float>(
-      memoryInfo, outputTensorValues.data(), outputTensorSize,
-      outputDims.data(), outputDims.size()));
+  std::vector<Ort::Value> out = session.Run(Ort::RunOptions{nullptr},
+      inputNames.data(), inputTensors.data(), 1, outputNames.data(), outputNames.size());
 
-  session.Run(Ort::RunOptions{nullptr}, inputNames.data(),
-              inputTensors.data(), 1, outputNames.data(),
-              outputTensors.data(), 1);
-
-  size_t numClasses = labels.size();
-
-  size_t count = 0;
-  std::vector<detection> det;
-  for (size_t b = 0; b < YOLO_NUM_BB; ++b)
+  float* bboxes = out[0].GetTensorMutableData<float>();
+  int* labelsIndex = out[1].GetTensorMutableData<int>();
+  float* scores = out[2].GetTensorMutableData<float>();
+  for (int i = 0; i < out[0].GetTensorTypeAndShapeInfo().GetShape()[1]; ++i)
   {
-    for (size_t y = 0; y < YOLO_GRID_Y; ++y)
+    if (scores[i] > 0.1)
     {
-      for (size_t x = 0; x < YOLO_GRID_X; ++x)
-      {
-        int offs = offset_(b, y, x, numClasses);
-        float tc = outputTensorValues[offset(offs, 4)];
-        float conf = Sigmoid(tc);
-
-        if (conf > confidenceThreshold)
-        {
-          float tx = outputTensorValues[offs];
-          float ty = outputTensorValues[offset(offs, 1)];
-          float tw = outputTensorValues[offset(offs, 2)];
-          float th = outputTensorValues[offset(offs, 3)];
-
-          float xPos = ((float) x + Sigmoid(tx)) * 32;
-          float yPos = ((float) y + Sigmoid(ty)) * 32;
-          float wBox = (float) exp(tw) * anchors[2 * b + 0] * 32;
-          float hBox = (float) exp(th) * anchors[2 * b + 1] * 32;
-
-          Box bb = FloatToBox(xPos, yPos, wBox, hBox);
-
-          float classes[numClasses];
-          for (int c = 0; c < numClasses; ++c)
-            classes[c] = outputTensorValues[offset(offs, 5 + c)];
-
-          Softmax(classes, numClasses);
-          float maxPD = 0;
-          int detected = -1;
-
-          for (int c = 0; c < numClasses; ++c)
-          {
-            if (classes[c] > maxPD)
-            {
-              detected = c;
-              maxPD = classes[c];
-            }
-          }
-
-          float score = maxPD * conf;
-          if (score > maskThreshold)
-          {
-            detection d = {bb, conf , detected, maxPD};
-            det.push_back(d);
-            count++;
-          }
-        }
-      }
+      std::cout << "score: " << scores[i] << std::endl;
+      std::cout << "label: " << labelsIndex[i] << std::endl;
+      std::cout << "["
+                << bboxes[i * 4] << ", "
+                << bboxes[i * 4 + 1] << ", "
+                << bboxes[i * 4 + 2] << ", "
+                << bboxes[i * 4 + 3]
+                << "]" << std::endl;
     }
-  }
-
-  // NMS filter.
-  FilterBoxesNMS(det, count, 0.2);
-
-  int j = 0;
-  for (int i = 0; i < count; ++i)
-  {
-    if (det[i].prob == 0) continue;
-    j++;
-
-    std::cout << std::endl;
-    std::cout << "Label: " << labels[det[i].c] << std::endl;
-    std::cout << "Bounding Box (X, Y, W, H): (" << det[i].bbox.x << ", "
-        << det[i].bbox.y << ", " << det[i].bbox.w << ", " << det[i].bbox.h << ")"
-        << std::endl;
-    std::cout << "Confidence (IoU): " << det[i].conf * 100 << "%" << std::endl;
-    std::cout << "Probability: " << det[i].prob * 100 << "%" << std::endl;
-    std::cout << "Score: " << det[i].prob * det[i].conf * 100 << "%"
-        << std::endl;
-
   }
 
   return 0;
