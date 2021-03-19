@@ -122,7 +122,7 @@ int main(int argc, char* argv[])
 
   const std::string modelFilepath = "data/models/model.onnx";
   const std::string imageFilepath = "data/images/test.jpg";
-  const std::string labelFilepath = "data/labels/VOC_pascal_classes.txt";
+  const std::string labelFilepath = "data/labels/COCO_classes.txt";
   const std::string instanceName = "image-classification-inference";
 
   const std::vector<std::string> labels = ReadLabels(labelFilepath);
